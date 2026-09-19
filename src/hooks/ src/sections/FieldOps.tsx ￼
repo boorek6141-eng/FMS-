@@ -1,0 +1,266 @@
+import { useMemo, useState, useEffect } from 'react';
+import { useFarm } from '@/store/FarmContext';
+import { useGeolocation } from '@/hooks/useGeolocation';
+import { generateSwathLines, nearestLine, polygonAreaHa, type LatLng } from '@/lib/fieldNav';
+import { Badge, Btn, Card, Input, Modal, SectionTitle, Select } from '@/components/common';
+import MapView from '@/components/MapView';
+
+interface OpConfig {
+  fieldId: string;
+  machineId: string;
+  treatmentType: string;
+  widthM: number;
+  angleDeg: number;
+  operator: string;
+}
+
+const TREATMENT_TYPES = ['oprysk', 'nawożenie', 'siew', 'lustracja', 'oranie', 'zbiory'];
+const DEFAULT_ANGLES = [0, 45, 90, 135];
+
+function DeviationGauge({ deviation, side, widthM }: { deviation: number; side: -1 | 0 | 1; widthM: number }) {
+  const maxDev = Math.max(widthM / 2, 1);
+  const pct = Math.max(-100, Math.min(100, (deviation / maxDev) * 100));
+  const color = deviation < 0.3 ? 'bg-emerald-500' : deviation < 1 ? 'bg-amber-500' : 'bg-red-500';
+  return (
+    <div className="flex flex-col items-center gap-1">
+      <div className="text-[10px] uppercase tracking-wide text-slate-400">Odchylenie od linii</div>
+      <div className="relative w-64 h-8 bg-slate-800 rounded-lg overflow-hidden border border-slate-600">
+        <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-slate-400 -translate-x-1/2" />
+        <div className="absolute left-1/2 top-0 bottom-0 w-8 bg-emerald-500/20 -translate-x-1/2" />
+        <div className={`absolute top-1 bottom-1 w-4 rounded ${color} transition-all duration-300`} style={{ left: `calc(50% + ${pct}% - 8px)` }} />
+      </div>
+      <div className="flex justify-between w-64 text-[10px] text-slate-500">
+        <span>← {side === -1 ? 'LEWO' : ''}</span>
+        <span className="font-mono text-sm text-slate-200">{deviation.toFixed(2)} m {side === 1 ? '→' : side === -1 ? '←' : ''}</span>
+        <span>{side === 1 ? 'PRAWO' : ''} →</span>
+      </div>
+    </div>
+  );
+}
+
+function HeadingArrow({ heading, targetBearing }: { heading: number | null; targetBearing: number }) {
+  const h = heading ?? 0;
+  const diff = ((targetBearing - h + 540) % 360) - 180;
+  return (
+    <div className="flex flex-col items-center">
+      <div className={`w-16 h-16 rounded-full border-4 flex items-center justify-center text-3xl transition-transform duration-200 ${
+        Math.abs(diff) < 10 ? 'border-emerald-500 text-emerald-400' : Math.abs(diff) < 45 ? 'border-amber-500 text-amber-400' : 'border-red-500 text-red-400'
+      }`} style={{ transform: `rotate(${diff}deg)` }}>➤</div>
+      <div className="text-xs text-slate-400 mt-1">{Math.abs(diff) < 10 ? '✓ Na kursie' : diff > 0 ? `Skręć w prawo o ${Math.abs(diff).toFixed(0)}°` : `Skręć w lewo o ${Math.abs(diff).toFixed(0)}°`}</div>
+    </div>
+  );
+}
+
+export default function FieldOps() {
+  const { state, addTreatment, notify } = useFarm();
+  const geo = useGeolocation();
+  const [cfg, setCfg] = useState<OpConfig>({ fieldId: '', machineId: '', treatmentType: 'oprysk', widthM: 24, angleDeg: 0, operator: '' });
+  const [phase, setPhase] = useState<'setup' | 'navigate' | 'summary'>('setup');
+  const [lines, setLines] = useState<LatLng[][]>([]);
+  const [origin, setOrigin] = useState<LatLng | null>(null);
+  const [confirmEnd, setConfirmEnd] = useState(false);
+  const [nightMode, setNightMode] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [vibrationEnabled, setVibrationEnabled] = useState(true);
+  const [lastVoiceAlert, setLastVoiceAlert] = useState(0);
+  const [lastVibration, setLastVibration] = useState(0);
+
+  const field = state.fields.find(f => f.id === cfg.fieldId);
+  const machine = state.machines.find(m => m.id === cfg.machineId);
+
+  useEffect(() => {
+    if (!field || field.geo.length < 3 || cfg.widthM <= 0) { setLines([]); return; }
+    const { lines: l, origin: o } = generateSwathLines(field.geo, cfg.widthM, cfg.angleDeg);
+    setLines(l); setOrigin(o);
+  }, [field, cfg.widthM, cfg.angleDeg]);
+
+  const navInfo = useMemo(() => {
+    if (!geo.position || lines.length === 0 || !origin) return null;
+    return nearestLine([geo.position.lat, geo.position.lng], lines, origin);
+  }, [geo.position, lines, origin]);
+
+  const targetBearing = useMemo(() => {
+    if (!navInfo || !geo.position) return 0;
+    const [a, b] = [navInfo.line[0], navInfo.line[navInfo.line.length - 1]];
+    const d1 = Math.hypot(a[0] - geo.position.lat, a[1] - geo.position.lng);
+    const d2 = Math.hypot(b[0] - geo.position.lat, b[1] - geo.position.lng);
+    const target = d1 < d2 ? a : b;
+    const dLat = target[0] - geo.position.lat;
+    const dLng = (target[1] - geo.position.lng) * Math.cos(geo.position.lat * Math.PI / 180);
+    return (Math.atan2(dLng, dLat) * 180 / Math.PI + 360) % 360;
+  }, [navInfo, geo.position]);
+
+  const visitedLines = useMemo(() => {
+    if (!geo.trail.length || lines.length === 0 || !origin) return new Set<number>();
+    const visited = new Set<number>();
+    geo.trail.forEach(pt => {
+      const n = nearestLine(pt as LatLng, lines, origin);
+      if (n && n.distance < cfg.widthM / 2) visited.add(n.lineIdx);
+    });
+    return visited;
+  }, [geo.trail, lines, origin, cfg.widthM]);
+
+  const progressPct = lines.length > 0 ? (visitedLines.size / lines.length) * 100 : 0;
+  const fieldAreaHa = field ? polygonAreaHa(field.geo) : 0;
+
+  useEffect(() => {
+    if (!navInfo || phase !== 'navigate') return;
+    const dev = navInfo.distance;
+    const now = Date.now();
+    if (vibrationEnabled && dev > 0.5 && now - lastVibration > 2000) {
+      if ('vibrate' in navigator) navigator.vibrate(dev > 1 ? [200, 100, 200] : 100);
+      setLastVibration(now);
+    }
+    if (voiceEnabled && dev > 1 && now - lastVoiceAlert > 5000) {
+      if ('speechSynthesis' in window) {
+        const side = navInfo.side === 1 ? 'w prawo' : navInfo.side === -1 ? 'w lewo' : '';
+        const msg = new SpeechSynthesisUtterance(`Odchylenie ${dev.toFixed(1)} metra ${side}`);
+        msg.lang = 'pl-PL'; msg.rate = 1.3; msg.volume = 0.8;
+        window.speechSynthesis.speak(msg);
+      }
+      setLastVoiceAlert(now);
+    }
+  }, [navInfo, phase, voiceEnabled, vibrationEnabled, lastVoiceAlert, lastVibration]);
+
+  const startNavigation = () => {
+    if (!field || !machine) { notify('Wybierz pole i ciągnik', 'err'); return; }
+    if (lines.length === 0) { notify('Brak linii — sprawdź szerokość', 'err'); return; }
+    geo.startTracking();
+    setPhase('navigate');
+  };
+
+  const finishOperation = () => {
+    geo.stopTracking();
+    if (field) {
+      addTreatment({
+        date: new Date().toISOString().slice(0, 10),
+        type: cfg.treatmentType,
+        fieldId: field.id,
+        crop: state.fieldCrops.find(c => c.fieldId === field.id && c.season === 2026)?.cropName || '—',
+        machineId: machine?.id,
+        operator: cfg.operator || undefined,
+        notes: `Tryb pracy polowej | Szerokość: ${cfg.widthM}m | Linii: ${lines.length} | Wykonano: ${visitedLines.size}`,
+        cost: 0,
+        season: 2026,
+      });
+      notify('Zabieg zapisany do dziennika');
+    }
+    setPhase('summary');
+    setConfirmEnd(false);
+  };
+
+  if (phase === 'setup') {
+    return (
+      <div className="space-y-4">
+        <SectionTitle title="🚜 Tryb Pracy Polowej" sub="Nawigacja GPS po polu — wybierz parametry i rozpocznij" />
+        {!geo.isSupported && <div className="p-3 rounded-lg bg-red-900/30 border border-red-700 text-red-200 text-sm">⚠️ Geolokacja nieobsługiwana — użyj Chrome/Safari na telefonie</div>}
+        <div className="grid md:grid-cols-3 gap-4">
+          <Card>
+            <h3 className="font-semibold text-slate-200 mb-3">1️⃣ Pole i maszyna</h3>
+            <div className="space-y-3">
+              <Select label="Pole" value={cfg.fieldId} onChange={e => setCfg(c => ({ ...c, fieldId: e.target.value }))}>
+                <option value="">— wybierz —</option>
+                {state.fields.map(f => <option key={f.id} value={f.id}>{f.name} · {f.area} ha</option>)}
+              </Select>
+              <Select label="Ciągnik" value={cfg.machineId} onChange={e => setCfg(c => ({ ...c, machineId: e.target.value }))}>
+                <option value="">— wybierz —</option>
+                {state.machines.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </Select>
+              <Select label="Zabieg" value={cfg.treatmentType} onChange={e => setCfg(c => ({ ...c, treatmentType: e.target.value }))}>
+                {TREATMENT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+              </Select>
+              <Input label="Operator" value={cfg.operator} onChange={e => setCfg(c => ({ ...c, operator: e.target.value }))} placeholder="np. Jan Kowalski" />
+            </div>
+          </Card>
+          <Card>
+            <h3 className="font-semibold text-slate-200 mb-3">2️⃣ Parametry nawigacji</h3>
+            <div className="space-y-3">
+              <Input label="Szerokość maszyny (m)" type="number" step="0.5" min="1" max="50" value={cfg.widthM} onChange={e => setCfg(c => ({ ...c, widthM: +e.target.value }))} />
+              <Select label="Kierunek linii" value={cfg.angleDeg} onChange={e => setCfg(c => ({ ...c, angleDeg: +e.target.value }))}>
+                {DEFAULT_ANGLES.map(a => <option key={a} value={a}>{a === 0 ? '↕ N-S' : a === 90 ? '↔ E-W' : a === 45 ? '↗ NE-SW' : '↖ NW-SE'}</option>)}
+              </Select>
+              {lines.length > 0 && <div className="text-xs text-emerald-300 bg-emerald-900/20 p-2 rounded">✓ {lines.length} linii nawigacyjnych</div>}
+            </div>
+          </Card>
+          <Card>
+            <h3 className="font-semibold text-slate-200 mb-3">Podgląd</h3>
+            <div className="h-48 rounded-lg overflow-hidden border border-slate-700">
+              {field ? <MapView fields={[field]} colorFor={() => '#10b981'} height="100%" /> : <div className="h-full flex items-center justify-center text-slate-500 text-sm">Wybierz pole</div>}
+            </div>
+          </Card>
+        </div>
+        <div className="flex justify-end">
+          <Btn onClick={startNavigation} disabled={!field || !machine || lines.length === 0 || !geo.isSupported} className="px-8 py-3 text-lg">🚀 Rozpocznij pracę</Btn>
+        </div>
+      </div>
+    );
+  }
+
+  if (phase === 'navigate') {
+    return (
+      <div className={`fixed inset-0 z-[80] flex flex-col ${nightMode ? 'bg-black' : 'bg-slate-950'}`}>
+        <div className={`flex items-center justify-between px-4 py-3 border-b ${nightMode ? 'bg-black border-red-900' : 'bg-slate-900 border-slate-700'}`}>
+          <div>
+            <div className="font-bold text-slate-100">{field?.name} — {cfg.treatmentType}</div>
+            <div className="text-xs text-slate-400">{machine?.name} · {cfg.widthM}m</div>
+          </div>
+          <Badge tone={geo.error ? 'bad' : geo.tracking ? 'ok' : 'warn'}>{geo.error ? '⚠️ BRAK GPS' : geo.tracking ? '📡 GPS' : '⏸'}</Badge>
+        </div>
+        <div className="flex-1 relative">
+          {field && <MapView fields={[field]} colorFor={() => '#10b981'} height="100%" center={geo.position ? [geo.position.lat, geo.position.lng] : undefined} />}
+          <div className="absolute inset-x-0 bottom-0 p-4 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent pointer-events-none">
+            <div className="pointer-events-auto max-w-md mx-auto space-y-3">
+              {navInfo && (
+                <div className={`backdrop-blur rounded-xl p-4 border ${nightMode ? 'bg-black/95 border-red-900' : 'bg-slate-900/90 border-slate-700'}`}>
+                  <DeviationGauge deviation={navInfo.distance} side={navInfo.side} widthM={cfg.widthM} />
+                  <div className="mt-3 flex justify-between text-xs text-slate-400"><span>Linia {navInfo.lineIdx + 1}/{lines.length}</span><span>Postęp: {progressPct.toFixed(0)}%</span></div>
+                  <div className="mt-1 h-2 bg-slate-700 rounded-full overflow-hidden"><div className="h-full bg-emerald-500 transition-all duration-500" style={{ width: `${progressPct}%` }} /></div>
+                </div>
+              )}
+              {geo.position && <div className="flex justify-center"><HeadingArrow heading={geo.position.heading} targetBearing={targetBearing} /></div>}
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className={`rounded-lg p-2 border ${nightMode ? 'bg-black/90 border-red-900' : 'bg-slate-900/90 border-slate-700'}`}><div className="text-[10px] text-slate-400">PRĘDKOŚĆ</div><div className="text-lg font-bold text-slate-100">{geo.position?.speed ? (geo.position.speed * 3.6).toFixed(1) : '0.0'}<span className="text-xs text-slate-400"> km/h</span></div></div>
+                <div className={`rounded-lg p-2 border ${nightMode ? 'bg-black/90 border-red-900' : 'bg-slate-900/90 border-slate-700'}`}><div className="text-[10px] text-slate-400">DOKŁADNOŚĆ</div><div className="text-lg font-bold text-slate-100">±{geo.position?.accuracy?.toFixed(0) ?? '—'}<span className="text-xs text-slate-400"> m</span></div></div>
+                <div className={`rounded-lg p-2 border ${nightMode ? 'bg-black/90 border-red-900' : 'bg-slate-900/90 border-slate-700'}`}><div className="text-[10px] text-slate-400">ŚLAD</div><div className="text-lg font-bold text-slate-100">{geo.trail.length}<span className="text-xs text-slate-400"> pkt</span></div></div>
+              </div>
+              <div className="flex gap-2 justify-center">
+                <button onClick={() => setNightMode(!nightMode)} className={`px-3 py-1.5 rounded-lg text-xs font-medium ${nightMode ? 'bg-red-900/50 text-red-300 border border-red-700' : 'bg-slate-800 text-slate-400 border border-slate-700'}`}>{nightMode ? '🔴 Nocny' : '🌙 Nocny'}</button>
+                <button onClick={() => setVoiceEnabled(!voiceEnabled)} className={`px-3 py-1.5 rounded-lg text-xs font-medium ${voiceEnabled ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-700' : 'bg-slate-800 text-slate-400 border border-slate-700'}`}>{voiceEnabled ? '🔊 Głos' : '🔇 Głos'}</button>
+                <button onClick={() => setVibrationEnabled(!vibrationEnabled)} className={`px-3 py-1.5 rounded-lg text-xs font-medium ${vibrationEnabled ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-700' : 'bg-slate-800 text-slate-400 border border-slate-700'}`}>{vibrationEnabled ? '📳 Wibracje' : '📴 Wibracje'}</button>
+              </div>
+              <div className="flex gap-2">
+                <Btn variant="danger" className="flex-1 py-3" onClick={() => setConfirmEnd(true)}>⏹ Zakończ zabieg</Btn>
+                <Btn variant="ghost" className="py-3" onClick={() => { if (geo.tracking) geo.stopTracking(); else geo.startTracking(); }}>{geo.tracking ? '⏸' : '▶️'}</Btn>
+              </div>
+            </div>
+          </div>
+        </div>
+        <Modal open={confirmEnd} onClose={() => setConfirmEnd(false)} title="Zakończyć zabieg?">
+          <div className="space-y-4">
+            <div className="text-sm text-slate-300">Postęp: <strong>{progressPct.toFixed(0)}%</strong> ({visitedLines.size} z {lines.length} linii)<br />Ślad GPS: {geo.trail.length} punktów</div>
+            <div className="flex gap-2">
+              <Btn variant="danger" className="flex-1" onClick={finishOperation}>✅ Tak, zapisz</Btn>
+              <Btn variant="ghost" className="flex-1" onClick={() => setConfirmEnd(false)}>Kontynuuj</Btn>
+            </div>
+          </div>
+        </Modal>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <SectionTitle title="✅ Zabieg zakończony" sub="Podsumowanie pracy polowej" />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Card className="!p-3"><div className="text-xs text-slate-400">Wykonano</div><div className="text-xl font-bold text-emerald-400 mt-1">{progressPct.toFixed(0)}%</div></Card>
+        <Card className="!p-3"><div className="text-xs text-slate-400">Czas</div><div className="text-xl font-bold text-slate-100 mt-1">{((geo.trail.length * 3) / 60).toFixed(0)} min</div></Card>
+        <Card className="!p-3"><div className="text-xs text-slate-400">Ślad GPS</div><div className="text-xl font-bold text-slate-100 mt-1">{geo.trail.length} pkt</div></Card>
+        <Card className="!p-3"><div className="text-xs text-slate-400">Powierzchnia</div><div className="text-xl font-bold text-slate-100 mt-1">{fieldAreaHa.toFixed(2)} ha</div></Card>
+      </div>
+      <div className="flex gap-2">
+        <Btn onClick={() => { setPhase('setup'); geo.clearTrail(); }}>🔄 Nowy zabieg</Btn>
+        <Btn variant="ghost" onClick={() => { setPhase('setup'); geo.clearTrail(); window.location.hash = 'dziennik'; }}>📋 Dziennik</Btn>
+      </div>
+    </div>
+  );
+}
